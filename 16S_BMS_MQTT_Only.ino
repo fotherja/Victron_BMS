@@ -295,7 +295,7 @@ void loop() {
     for (int i = 0; i < NUM_OF_CELLS; i++) {
       arr.add(Cell_Voltages[i]);
     }
-    serializeJson(doc, voltageJson);
+    serializeJson(doc, voltageJson, sizeof(voltageJson));
     Serial.println(voltageJson);
     client.publish("battery/cell_voltages", voltageJson);  
   }
@@ -311,21 +311,9 @@ void loop() {
     for (int i = 0; i < NUM_OF_CELLS; i++) {
       arr.add(Cell_Balance_Times[i]);
     }
-    serializeJson(doc, balanceJson);
+    serializeJson(doc, balanceJson, sizeof(balanceJson));
     Serial.println(balanceJson);
     client.publish("battery/balance_times", balanceJson); 
   }  
 }
-
-
-
-
-
-
-
-
-
-
-
-
 
