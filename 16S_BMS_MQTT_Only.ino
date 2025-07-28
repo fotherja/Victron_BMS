@@ -19,7 +19,8 @@
 *
 *
 * To Do:
-*   - Send Cell voltages
+*   - Send individual cell voltages - make a copy, then send 4/messages a second until 16 sent. do this once every minute
+*   - influxdb from node red
 * 
 */
 
@@ -28,7 +29,6 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>  // v6+
 #include "OpenBMS_James.h"
-#include "esp_timer.h"  
 
 //------------- Pin definitions --------------------
 #define LED_GREEN_PIN       0
@@ -55,8 +55,8 @@
 //------------- Other definitions --------------------
 #define NUM_OF_CELLS        16
 
-#define CUV_Delay				    0x9276   // [Default: 74 * 3.3 ms = 250 ms]
-#define COV_Delay				    0x9279   // [Default: 74 * 3.3 ms = 250 ms]
+#define CUV_Delay				    0x9276                                  // [Default: 74 * 3.3 ms = 250 ms]
+#define COV_Delay				    0x9279                                  // [Default: 74 * 3.3 ms = 250 ms]
 
 // Your credentials
 const char* ssid = "venus-HQ2306ZHQGJ-f3b";         
@@ -64,22 +64,17 @@ const char* password = "zz6tzefc";
 const char* mqtt_server = "192.168.188.122";                 
 
 // Time intervals in milliseconds
-const unsigned long TaskAInterval = 200;
-const unsigned long TaskBInterval = 5000;
-const unsigned long TaskCInterval = 15000;
-const unsigned long TaskDInterval = 60000;
-const unsigned long MQTT_Timeout  = 30000;
+const unsigned long TaskAInterval = 200;        // Runs client.loop(); and blinks balancing LED when balancing cells
+const unsigned long TaskBInterval = 5000;       // maintainConnections(); Reads battery metrics. Prints to debug, drives optoisolators
+const unsigned long TaskCInterval = 15000;      // allows/disallows balancing based on MQTT control or timeout 
+const unsigned long TaskDInterval = 60000;      // Sends cell voltage JSON over MQTT
+const unsigned long TaskEInterval = 900000;     // Sends cell balancing cumulative times JSON over MQTT
+
+const unsigned long MQTT_Timeout  = 30000;      // Time without recieving MQTT from node-red before we allow balancing 
 
 BQ76952             bms;
 WiFiClient          espClient;
 PubSubClient        client(espClient);
-
-// Buffers for JSON payloads
-char voltageJson[256];
-char balanceJson[512]; 
-
-uint16_t Cell_Voltages[16];
-uint32_t Cell_Balance_Times[16];
 
 // Flags to track first-time config
 bool              mqttConfigured = false;
@@ -139,7 +134,6 @@ void callback(char* topic, byte* payload, unsigned int length) {
   }
   Serial.println();
 
-  // Example: turn on LED if payload is "ON"
   if (strcmp(topic, "Balancing/permission") == 0) {
     Last_MQTT_Balancing_Packet = millis();
 
@@ -151,6 +145,9 @@ void callback(char* topic, byte* payload, unsigned int length) {
   }
 }
 
+// ####################################################################################################################
+// --------------------------------------------------------------------------------------------------------------------
+// ####################################################################################################################
 void maintainConnections() {
   // Attempt WiFi connection if not connected
   if (WiFi.status() != WL_CONNECTED) {
@@ -175,7 +172,6 @@ void maintainConnections() {
     } else {
       Serial.print("MQTT connect failed. State=");
       Serial.println(client.state());                               // Don't block; try again next time
-
     }
   }  
 }
@@ -183,38 +179,11 @@ void maintainConnections() {
 // ####################################################################################################################
 // --------------------------------------------------------------------------------------------------------------------
 // ####################################################################################################################
-void publishCellData() {
-  // Create voltage JSON
-  {
-    StaticJsonDocument<300> doc;
-    JsonArray arr = doc.to<JsonArray>();
-    for (int i = 0; i < 16; i++) {
-      arr.add(Cell_Voltages[i]);
-    }
-    serializeJson(doc, voltageJson);
-    Serial.println(voltageJson);
-    client.publish("battery/cell_voltages", voltageJson);
-  }
-
-  // Create balance times JSON
-  {
-    StaticJsonDocument<600> doc;
-    JsonArray arr = doc.to<JsonArray>();
-    for (int i = 0; i < 16; i++) {
-      arr.add(Cell_Balance_Times[i]);
-    }
-    serializeJson(doc, balanceJson);
-    Serial.println(balanceJson);
-    client.publish("battery/balance_times", balanceJson);
-  }
-}
-
-// ####################################################################################################################
-// --------------------------------------------------------------------------------------------------------------------
-// ####################################################################################################################
-void loop() {      
-
+void loop() { 
+  static uint16_t Cell_Voltages[17];
+  static uint32_t Cell_Balance_Times[17]; 
   unsigned long currentMillis = millis();
+
   delay(50);
 
   //----------------------------------------------------------------------------------------------------------------------  
@@ -282,12 +251,14 @@ void loop() {
     // Print out all the cell balance times
     Serial.print("Cell Balance Times: ");
     bms.GetCellBalancingTimes(Cell_Balance_Times);
-    for(byte i = 0;i < NUM_OF_CELLS;i++)  {
+    for (int i = 0; i < NUM_OF_CELLS; i++) {
+      Cell_Balance_Times[i] = Cell_Balance_Times[i + 1];  // shift left by 1
       Serial.print(Cell_Balance_Times[i]); Serial.print(", ");
     }
-    Serial.println();    
+    Serial.println();
 
-    // Print out temperatures
+    // Print out temperatures 
+    Serial.print("Temperatures: ");   
     Serial.print(bms.getThermistorTemp(TS1)); Serial.print(", ");  
     Serial.println(bms.getInternalTemp());
     Serial.println();
@@ -318,8 +289,32 @@ void loop() {
   if (currentMillis - TaskD_timestamp >= TaskDInterval) {
     TaskD_timestamp = currentMillis;
 
-    publishCellData();  
+    char voltageJson[256];
+    StaticJsonDocument<300> doc;
+    JsonArray arr = doc.to<JsonArray>();
+    for (int i = 0; i < NUM_OF_CELLS; i++) {
+      arr.add(Cell_Voltages[i]);
+    }
+    serializeJson(doc, voltageJson);
+    Serial.println(voltageJson);
+    client.publish("battery/cell_voltages", voltageJson);  
   }
+
+  //---------------------------------------------------------------------------------------------------------------------- 
+  static unsigned long TaskE_timestamp = 0;
+  if (currentMillis - TaskE_timestamp >= TaskEInterval) {
+    TaskE_timestamp = currentMillis;
+
+    char balanceJson[512];
+    StaticJsonDocument<600> doc;
+    JsonArray arr = doc.to<JsonArray>();
+    for (int i = 0; i < NUM_OF_CELLS; i++) {
+      arr.add(Cell_Balance_Times[i]);
+    }
+    serializeJson(doc, balanceJson);
+    Serial.println(balanceJson);
+    client.publish("battery/balance_times", balanceJson); 
+  }  
 }
 
 

@@ -17,6 +17,5 @@
 // Function prototypes:
 void maintainConnections(void);
 void callback(char* topic, byte* payload, unsigned int length);
-void publishCellData();
 
 #endif
