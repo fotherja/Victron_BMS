@@ -1,33 +1,30 @@
 /*
 * Description :   Software for a 16S BMS based on the BQ76952 and an ESP32. 
 * Author      :   James Fotherby
-* Date        :   08/04/2025
+* Date        :   31/07/2025
 * License     :   MIT
 * This code is published as open source software. Feel free to share/modify.
 *
 * Purpose of software:
-*     # Detect cell under and over voltage and signal to the Multiplus using 2-signal-BMS
+*     # Detect cell under and over voltage and signal to the Multiplus using the 2-signal-BMS assistant 
 *     # Balance the cells - if we have WiFi and MQTT then balance cells if given permission via NodeRed
 *     # Send cell voltages to NodeRed
 *
 * IT IS VERY IMPORTANT NODE-RED IS CONFIGURED TO STOP ALL MPPTs WHEN THE 2-SIGNAL-BMS REQUESTS - This BMS has no direct control of the MPPTs
 *
-* In normal operation the BMS should never have to take action. The inverter or MPPT charger should have more conservative limits to shut off first. For 
+* In normal operation the BMS should never have to take action. The inverter or MPPT charger(s) should have more conservative limits to shut off first. For 
 * example the MPPT charger is set to charge to 53.6 volts (90% SOC) which is a cell voltage of 3.35 volts. This is far from the BMS cell overvoltage threshold 
 * of 3.5 volts. Likewise the inverter is set to discharge to 48.0 volts (10% SOC) which is 3.00 volts per cell and far from the BMS under voltage cut out of
 * 2.75 volts.
 *
-*
-* To Do:
-*   - Send individual cell voltages - make a copy, then send 4/messages a second until 16 sent. do this once every minute
-*   - influxdb from node red
-* 
+* To do:
+*  - We made some changes to the library and added a new function. We need to test whether this new function works.
 */
 
 #include <BQ76952.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
-#include <ArduinoJson.h>  // v6+
+#include <ArduinoJson.h>                                            // v6+
 #include "OpenBMS_James.h"
 
 //------------- Pin definitions --------------------
@@ -43,8 +40,8 @@
 #define BOOT_BTN_PIN        I2C_SCL_PIN
 
 #define AUX_1_PIN           10                                      // Use Aux 1 to disable the Multiplus II GX inverter
-#define AUX_3_PIN           11                                      // Use Aux 3 to disable the SmartSolar MPPT charger
-#define AUX_2_PIN           12
+#define AUX_3_PIN           11                                      
+#define AUX_2_PIN           12                                      // Use Aux 2 to disable the SmartSolar MPPT charger
 
 #define UART_TX             16
 #define UART_RX             17
@@ -54,23 +51,18 @@
 
 //------------- Other definitions --------------------
 #define NUM_OF_CELLS        16
-
-#define CUV_Delay				    0x9276                                  // [Default: 74 * 3.3 ms = 250 ms]
-#define COV_Delay				    0x9279                                  // [Default: 74 * 3.3 ms = 250 ms]
+#define Min_Cell_Temp       0x9336                                  
 
 // Your credentials
 const char* ssid = "venus-HQ2306ZHQGJ-f3b";         
 const char* password = "zz6tzefc";                 
-const char* mqtt_server = "192.168.188.122";                 
+const char* mqtt_server = "192.168.188.122";                
 
 // Time intervals in milliseconds
 const unsigned long TaskAInterval = 200;        // Runs client.loop(); and blinks balancing LED when balancing cells
-const unsigned long TaskBInterval = 5000;       // maintainConnections(); Reads battery metrics. Prints to debug, drives optoisolators
-const unsigned long TaskCInterval = 15000;      // allows/disallows balancing based on MQTT control or timeout 
+const unsigned long TaskBInterval = 5000;       // maintainConnections(); Reads battery metrics. Prints to debug, drives optoisolators     
 const unsigned long TaskDInterval = 60000;      // Sends cell voltage JSON over MQTT
 const unsigned long TaskEInterval = 900000;     // Sends cell balancing cumulative times JSON over MQTT
-
-const unsigned long MQTT_Timeout  = 30000;      // Time without recieving MQTT from node-red before we allow balancing 
 
 BQ76952             bms;
 WiFiClient          espClient;
@@ -78,13 +70,12 @@ PubSubClient        client(espClient);
 
 // Flags to track first-time config
 bool              mqttConfigured = false;
-bool              allowbalancing = true;
-uint32_t          Last_MQTT_Balancing_Packet = 0;
 
 // ####################################################################################################################
 // --------------------------------------------------------------------------------------------------------------------
 // ####################################################################################################################
 void setup() {
+  delay(1000);
   Serial.begin(115200);
   bms.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   bms.reset();
@@ -92,9 +83,10 @@ void setup() {
 
   // Configure the BQ76952:
   bms.setConnectedCells(NUM_OF_CELLS);  
+
   bms.writeByteToMemory(CUV_Threshold, 55);                         // Set Cell undervoltage protection to 2.75 volts (units: 50.6 mV)
-  bms.writeByteToMemory(COV_Threshold, 70);                         // Set Cell overvoltage protection to 3.50 volts 
-  bms.writeIntToMemory(CUV_Delay, 1513);                            // 5 Second delay before a CUV triggers a fault
+  bms.writeByteToMemory(COV_Threshold, 68);                         // Set Cell overvoltage protection to 3.50 volts 
+  bms.writeIntToMemory(CUV_Delay, 1513);                            // 5 Second delay before a CUV/COV triggers a fault. Default 100 mV hysterisis
   bms.writeIntToMemory(COV_Delay, 1513);
 
   bms.writeByteToMemory(Enabled_Protections_A, 0b00001100);         // Enable CUV, COV circuit protection
@@ -102,7 +94,11 @@ void setup() {
 
   bms.writeIntToMemory(Cell_Balance_Min_Cell_V_Relaxed, 3350);      // Only balance when cells above 3350 mV (Top balance)
   bms.writeByteToMemory(Cell_Balance_Max_Cells, 8);                 // Allows up to 8 simultaneous cells to be balanced
-  bms.writeByteToMemory(Balancing_Configuration, 0b00000010);       // Enables autonomous balancing in realxed state (CB_RLX)
+  bms.writeByteToMemory(DA_Configuration, 0b00001101);              // Set chip die to be for cell temp measurment
+
+  //bms.writeByteToMemory(Min_Cell_Temp, -127);
+  bms.writeByteToMemory(TS1_Config, 0b00000000);                    // Configures TS1 not to be used (By default it's used as a cell temp input)
+  bms.writeByteToMemory(Balancing_Configuration, 0b00000011);       // Enables autonomous balancing
   bms.writeIntToMemory(Power_Config, 0b0010100010110010);           // Disables SLEEP, slow measurement speed when balancing to 1/8th
 
   bms.writeByteToMemory(FET_Options, 0b00000000);                   // FETs will not be turned on
@@ -135,13 +131,10 @@ void callback(char* topic, byte* payload, unsigned int length) {
   Serial.println();
 
   if (strcmp(topic, "Balancing/permission") == 0) {
-    Last_MQTT_Balancing_Packet = millis();
-
     if ((char)payload[0] == 'N' && (char)payload[1] == 'o') {
-      allowbalancing = false;
-    } else {
-      allowbalancing = true;
-    }
+      uint8_t payload[2] = {0, 0};
+      bms.subCommandWriteData(CB_ACTIVE_CELLS, payload, sizeof(payload));         // Disables balancing for Cell Balance Interval (default 20 seconds)   
+    } 
   }
 }
 
@@ -180,11 +173,11 @@ void maintainConnections() {
 // --------------------------------------------------------------------------------------------------------------------
 // ####################################################################################################################
 void loop() { 
-  static uint16_t Cell_Voltages[17];
-  static uint32_t Cell_Balance_Times[17]; 
+  static uint16_t Cell_Voltages[NUM_OF_CELLS];
+  static uint32_t Cell_Balance_Times[NUM_OF_CELLS]; 
   unsigned long currentMillis = millis();
 
-  delay(50);
+  delay(1);
 
   //----------------------------------------------------------------------------------------------------------------------  
   static unsigned long TaskA_timestamp = 0;
@@ -252,36 +245,14 @@ void loop() {
     Serial.print("Cell Balance Times: ");
     bms.GetCellBalancingTimes(Cell_Balance_Times);
     for (int i = 0; i < NUM_OF_CELLS; i++) {
-      Cell_Balance_Times[i] = Cell_Balance_Times[i + 1];  // shift left by 1
       Serial.print(Cell_Balance_Times[i]); Serial.print(", ");
     }
     Serial.println();
 
     // Print out temperatures 
-    Serial.print("Temperatures: ");   
-    Serial.print(bms.getThermistorTemp(TS1)); Serial.print(", ");  
+    Serial.print("Temp: ");     
     Serial.println(bms.getInternalTemp());
     Serial.println();
-  }
-
-  //---------------------------------------------------------------------------------------------------------------------- 
-  static unsigned long TaskC_timestamp = 0;
-  if (currentMillis - TaskC_timestamp >= TaskCInterval) {
-    TaskC_timestamp = currentMillis;
-
-    // If no MQTT messages arriving assume control from NodeRed is lost and enable balancing
-    if (currentMillis - Last_MQTT_Balancing_Packet >= MQTT_Timeout) {
-      allowbalancing = true;
-    }
-
-    if(allowbalancing == true)  {
-      bms.writeByteToMemory(Balancing_Configuration, 0b00000010);       // Enables autonomous balancing
-      Serial.println("Cell balancing Enabled");
-    }
-    else  {
-      bms.writeByteToMemory(Balancing_Configuration, 0b00000000);       // Disables autonomous balancing
-      Serial.println("Cell balancing Disabled");
-    }
   }
 
   //---------------------------------------------------------------------------------------------------------------------- 
@@ -297,7 +268,33 @@ void loop() {
     }
     serializeJson(doc, voltageJson, sizeof(voltageJson));
     Serial.println(voltageJson);
-    client.publish("battery/cell_voltages", voltageJson);  
+    client.publish("battery/cell_voltages", voltageJson); 
+
+  //-----------------------------------------------------------------------------------------
+    byte* voltage_data = bms.subCommandwithdata(DASTATUS_5, 32);            
+
+    // Define variables for each data item
+    uint16_t VREG18 = (voltage_data[1] << 8) | voltage_data[0]; // 16-bit
+    uint16_t VSS = (voltage_data[3] << 8) | voltage_data[2];    // 16-bit
+    uint16_t MaxCellVoltage = (voltage_data[5] << 8) | voltage_data[4]; // 16-bit
+    uint16_t MinCellVoltage = (voltage_data[7] << 8) | voltage_data[6]; // 16-bit
+    uint16_t BatteryVoltageSum = (voltage_data[9] << 8) | voltage_data[8]; // 16-bit
+    uint16_t AvgCellTemperature = (voltage_data[11] << 8) | voltage_data[10]; // 16-bit
+    uint16_t FETTemperature = (voltage_data[13] << 8) | voltage_data[12]; // 16-bit
+    uint16_t MaxCellTemperature = (voltage_data[15] << 8) | voltage_data[14]; // 16-bit
+    uint16_t MinCellTemperature = (voltage_data[17] << 8) | voltage_data[16]; // 16-bit
+
+    // Print the extracted data for verification
+    Serial.println(F("Extracted Voltage Data:"));
+    Serial.print(F("VREG18: ")); Serial.println(VREG18);
+    Serial.print(F("VSS: ")); Serial.println(VSS);
+    Serial.print(F("Max Cell Voltage: ")); Serial.println(MaxCellVoltage);
+    Serial.print(F("Min Cell Voltage: ")); Serial.println(MinCellVoltage);
+    Serial.print(F("Battery Voltage Sum: ")); Serial.println(BatteryVoltageSum);
+    Serial.print(F("Avg Cell Temperature: ")); Serial.println(AvgCellTemperature);
+    Serial.print(F("FET Temperature: ")); Serial.println(FETTemperature);
+    Serial.print(F("Max Cell Temperature: ")); Serial.println(MaxCellTemperature);
+    Serial.print(F("Min Cell Temperature: ")); Serial.println(MinCellTemperature);
   }
 
   //---------------------------------------------------------------------------------------------------------------------- 
